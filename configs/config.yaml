@@ -1,0 +1,572 @@
+# ai-dev-squad — AI Dev Squad (Jira → plan → Claude Agent SDK build → PR → review → merge)
+#
+# A Jira-driven autonomous software-development squad. See PRD.md for the
+# full design. The coder is the REAL Claude Agent SDK, run in-process via
+# LeafMesh's native `claude_agent` external framework — pure YAML, no
+# connector code. The chain flows FORWARD (no conductor hub); the one
+# automated cycle (reviewer ⇄ developer) is bounded in the reviewer's
+# module.
+
+name: "ai-dev-squad"
+version: "1.0.0"
+architecture: "managed_mesh"
+environment: "development"
+debug: true
+log_level: "INFO"
+
+redis:
+  host: "${REDIS_HOST:localhost}"
+  port: ${REDIS_PORT:6379}
+  db: 0
+  password: "${REDIS_PASSWORD:}"
+  auto_storage: true
+  decode_responses: true
+  default_ttl: 86400
+  session_ttl: 1209600          # 14d — tickets are long-lived
+
+# ─────────────────────────────────────────────────────────────────────
+# EVENT BROKERS — where Jira pushes events the squad listens to.
+# DEV: a thin webhook receiver writes Jira "issue assigned to us" events
+# into a Redis stream (same Redis, no extra dependency). PROD: point at
+# your real bus (Kafka / SQS) — uncomment one and `pip install
+# leafmesh[kafka]` or `[sqs]`.
+# ─────────────────────────────────────────────────────────────────────
+brokers:
+  jira_events:
+    type: "redis_streams"
+    url: "${JIRA_EVENTS_REDIS_URL:redis://localhost:6379}"
+    db: 1
+  # PROD — Jira webhooks → SQS:
+  # jira_events:
+  #   type: "sqs"
+  #   region: "${AWS_REGION:us-east-1}"
+  # PROD — Jira webhooks → Kafka:
+  # jira_events:
+  #   type: "kafka"
+  #   bootstrap_servers: ["${KAFKA_BOOTSTRAP:kafka:9092}"]
+
+auto_discover:
+  directory: "./agency"
+  pattern: "*_agent.py"
+  recursive: false
+
+manager:
+  enabled: true
+  model: "gpt-4o-mini"
+  domain: "generic"
+  can_intervene: true
+  prompt: |
+    AI software-development squad. The motion:
+      - product_owner grooms a raw request into a well-formed ticket
+        (acceptance criteria + priority + QA discipline); a stakeholder
+        signs off scope, then it enters the squad's queue
+      - dev_planner pulls the Jira tickets assigned to us, picks the best
+        one, writes a plan, and pings the tech lead with the ticket URL
+      - tech_lead approves the plan → the developer (Claude Agent SDK)
+        implements it: edit, test, commit, push, open a PR, update docs
+      - qa_agent independently RE-RUNS the test cases for its discipline on
+        the PR and files any bugs into Jira; clean → code_reviewer, failing
+        → back to the developer (bounded). QA also works its own assigned
+        test tickets standalone.
+      - code_reviewer reads the PR; clean → tech_lead merges; issues →
+        senior or back to the developer (bounded rework)
+    Escalate when:
+      - a plan is unreviewed > 1 day
+      - a PR bounces between reviewer and developer past the rework cap
+      - the developer run fails (no PR produced)
+
+  routing:
+    mode: "learning"
+    confidence_threshold: 0.7
+    fallback: "all"
+
+mesh:
+  call_timeout: 1800            # the developer run is long
+
+data_structures:
+  Ticket:
+    type: "object"
+    properties:
+      ticket_id:   { type: "string" }
+      key:         { type: "string" }   # e.g. ENG-1234
+      url:         { type: "string" }
+      title:       { type: "string" }
+      priority:    { type: "string" }
+      assignee:    { type: "string" }
+    required: ["assignee"]
+
+# ─────────────────────────────────────────────────────────────────────
+# ENTRY POINTS
+# ─────────────────────────────────────────────────────────────────────
+entry_points:
+  - name: "new_request"
+    target: "product_owner_agent"
+    description: "A stakeholder / intake form submits a raw feature request or bug report"
+  - name: "direct_call_po"
+    target: "product_owner_agent"
+    description: "Run the product owner directly (debug / replay)"
+  - name: "ticket_assigned"
+    target: "dev_planner_agent"
+    description: "Jira assigned a ticket to the squad (webhook/event)"
+  - name: "poll_assigned_tickets"
+    target: "dev_planner_agent"
+    description: "Cron — sweep the assigned-ticket queue and pick the next"
+  - name: "qa_ticket_assigned"
+    target: "qa_agent"
+    description: "Jira assigned a QA/test ticket to the squad (label: qa)"
+  - name: "poll_qa_tickets"
+    target: "qa_agent"
+    description: "Cron — sweep the assigned QA/test queue"
+  - name: "direct_call_qa"
+    target: "qa_agent"
+    description: "Run the QA agent directly (debug / replay)"
+  - name: "pr_review_requested"
+    target: "code_reviewer_agent"
+    description: "A PR was opened/updated (GitHub webhook)"
+  - name: "direct_call_planner"
+    target: "dev_planner_agent"
+    description: "Run the planner directly (debug / replay)"
+  - name: "direct_call_developer"
+    target: "developer_agent"
+    description: "Run the developer on an approved plan directly"
+  - name: "direct_call_reviewer"
+    target: "code_reviewer_agent"
+    description: "Run a PR review directly"
+  - name: "direct_call_merge"
+    target: "merge_coordinator_agent"
+    description: "Run the CI-gate + merge directly"
+
+# ─────────────────────────────────────────────────────────────────────
+# AGENTS
+# ─────────────────────────────────────────────────────────────────────
+agents:
+
+  # ── 4.0 PRODUCT OWNER (LLM) — upstream of the planner ───────────
+  # Turns a raw request (or a bare Jira ticket) into a WELL-FORMED ticket:
+  # crisp title, description, TESTABLE acceptance_criteria (what QA checks
+  # against), priority, and a QA discipline hint — dedupes it, then files
+  # it to Jira (status: triage). A stakeholder signs off scope before it
+  # enters the dev queue. This FEEDS the chain; it has no back-edge from it.
+  product_owner_agent:
+    name: "product_owner_agent"
+    agent_type: "llm"
+    description: "Product owner — grooms a raw request into a well-formed Jira ticket (acceptance criteria + priority + QA discipline), dedupes against the backlog, files it for the squad"
+    model: "claude-sonnet-4-6"
+    temperature: 0.3
+    max_completion_tokens: 3000
+    communication_type: "chain"
+    # Hear raw tickets created in Jira that need grooming — parallel to the
+    # new_request entry point a stakeholder / intake form posts to.
+    listen_events:
+      - broker: "jira_events"
+        stream: "jira:created"
+        consumer_group: "dev-squad-po"
+        filter: { type: "jira.issue.created" }
+    prompt: |
+      You are the product owner for a software squad.
+      context["prepared_data"] carries the raw request and the titles of
+      the currently-open tickets.
+
+      Groom the request into ONE well-formed ticket:
+        1. A crisp title and a clear description (problem + intent).
+        2. TESTABLE acceptance_criteria — the concrete, observable
+           conditions QA will verify (not "works well").
+        3. priority: critical | high | medium | low.
+        4. discipline: backend | api | frontend — the QA lane this needs.
+        5. If it duplicates an open ticket, set duplicate_of to that title
+           and ticket_ready=false. If it's too vague to groom, set
+           not_actionable=true. Otherwise ticket_ready=true.
+
+      Leave ticket_id / ticket_key / ticket_url as "" — they are filled
+      when the ticket is filed.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"title": "", "description": "", "acceptance_criteria": [], "priority": "medium", "discipline": "backend", "ticket_ready": false, "duplicate_of": "", "not_actionable": false, "ticket_id": "", "ticket_key": "", "ticket_url": ""}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    tools: ["jira_update"]
+    yields:
+      title: "string"
+      description: "string"
+      acceptance_criteria: "list"
+      priority: "string"
+      discipline: "string"
+      ticket_ready: "boolean"
+      duplicate_of: "string"
+      not_actionable: "boolean"
+      ticket_id: "string"
+      ticket_key: "string"
+      ticket_url: "string"
+    inputs:
+      request: "string"
+    can_call:
+      - agent: "stakeholder_human"
+        condition: "calling_agent_response.ticket_ready == true and calling_agent_response.duplicate_of == ''"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.not_actionable == true or calling_agent_response.duplicate_of != ''"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.1 PLANNER (LLM) ───────────────────────────────────────────
+  dev_planner_agent:
+    name: "dev_planner_agent"
+    agent_type: "llm"
+    description: "Pulls the Jira tickets assigned to the squad, picks the best one, writes an implementation plan, pings the tech lead"
+    model: "claude-sonnet-4-6"
+    temperature: 0.2
+    max_completion_tokens: 3000
+    communication_type: "chain"
+    wake_up: "*/30 * * * *"            # poll the assigned queue every 30 min (safety net)
+    # ALSO hear Jira live — event-driven, parallel to the cron + entry point.
+    # When a ticket is assigned to the squad, Jira pushes an event here and
+    # the planner wakes immediately (then pre_compose pulls the full queue
+    # and picks the best — the event is the trigger, not the whole payload).
+    listen_events:
+      - broker: "jira_events"
+        stream: "jira:assigned"
+        consumer_group: "dev-squad-planner"
+        filter: { type: "jira.issue.assigned" }   # CloudEvents-style; squad-assigned only
+    prompt: |
+      You are the planner for an autonomous dev squad.
+      context["prepared_data"] carries the tickets ASSIGNED to us, already
+      pulled from Jira and sorted by priority then age (pre_compose did
+      this). Reason over the real queue.
+
+      1. PICK the best ticket to work next: highest priority, then oldest,
+         then smallest effort; skip blocked / needs-info tickets. (Your
+         post-processor locks the deterministic pick — propose it here.)
+      2. WRITE a clear implementation plan for the picked ticket:
+         approach, files likely touched, test strategy, risks.
+      3. If the queue has no actionable ticket, set no_actionable_ticket=true.
+
+      Echo ticket_id / ticket_key / ticket_url for the picked ticket.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"ticket_id": "", "ticket_key": "", "ticket_url": "", "plan": "", "plan_ready": false, "no_actionable_ticket": false, "priority_rank": 0}
+    enforce_yields: true
+    enforce_yields_retry: 2
+    tools: ["jira_update"]          # write tooling — comment the plan onto the ticket at runtime
+    knowledge:
+      serviceName: "mongo_main"
+      enabled: true
+      groupName: "eng_playbook"
+    yields:
+      ticket_id: "string"
+      ticket_key: "string"
+      ticket_url: "string"
+      plan: "string"
+      plan_ready: "boolean"
+      no_actionable_ticket: "boolean"
+      priority_rank: "number"
+    inputs:
+      ticket_id: "string"
+    can_call:
+      - agent: "tech_lead_human"
+        condition: "calling_agent_response.plan_ready == true"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.no_actionable_ticket == true"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.3 DEVELOPER — the Claude Agent SDK (EXTERNAL · claude_agent)
+  developer_agent:
+    name: "developer_agent"
+    agent_type: "external"
+    framework: "claude_agent"
+    description: "The Claude Agent SDK — implements the approved ticket: edit, test, commit, push, open a PR, update docs"
+    communication_type: "chain"
+    connector_config:
+      # api_key falls back to ANTHROPIC_API_KEY
+      model: "claude-opus-4-8"
+      system_prompt: |
+        You are a senior software engineer. Implement the approved ticket
+        plan in this repository. Work on a new feature branch. Read the
+        codebase first; follow its conventions. Run the tests and make
+        them pass. Update any affected documentation IN THE SAME PR.
+        Commit with a clear message, push the branch, and open a pull
+        request with `gh pr create` (title + description summarising the
+        change and linking the ticket). Do not merge.
+      allowed_tools: ["Read", "Edit", "Write", "Bash", "Glob", "Grep"]
+      permission_mode: "acceptEdits"     # headless — no interactive prompts
+      cwd: "${DEV_REPO_PATH:}"           # the repo checkout to work in
+      max_turns: 40
+      timeout: 1800.0
+    yields:
+      pr_url: "string"
+      branch: "string"
+      files_changed: "number"
+      tests_passed: "boolean"
+      summary: "string"
+      ticket_id: "string"
+      dev_status: "string"          # success | tests_failing | blocked_needs_info
+    inputs:
+      ticket_id: "string"
+      plan: "string"
+    can_call:
+      # Fresh PR → hand to QA first (independent execution before human judgment)
+      - agent: "qa_agent"
+        condition: "calling_agent_response.pr_url != '' and calling_agent_response.dev_status != 'blocked_needs_info'"
+      # No PR, or the agent got stuck and needs clarification → a human
+      - agent: "tech_lead_human"
+        condition: "calling_agent_response.pr_url == '' or calling_agent_response.dev_status == 'blocked_needs_info'"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.3b QA ENGINEER — Jira-driven test executor (EXTERNAL · claude_agent)
+  # The independent executor. The developer self-reports "tests passed";
+  # QA RE-RUNS the test cases for its discipline against the build, so a
+  # false green can't reach review. It also works its OWN assigned test
+  # tickets (standalone, via Jira event/cron) and files every defect back
+  # into Jira as a bug — which the planner later picks up (find→fix loop).
+  # Discipline is set by QA_DISCIPLINE (backend|api|frontend); duplicate
+  # this block with a different name + discipline to run all three.
+  qa_agent:
+    name: "qa_agent"
+    agent_type: "external"
+    framework: "claude_agent"
+    description: "QA engineer — pulls its assigned test tickets (and tests fresh PRs), runs the test cases for its discipline (backend / api / frontend), files bugs back into Jira"
+    communication_type: "chain"
+    wake_up: "*/45 * * * *"            # sweep the assigned QA/test queue
+    # Hear Jira assign QA/test tickets live (label: qa), parallel to cron.
+    listen_events:
+      - broker: "jira_events"
+        stream: "jira:qa_assigned"
+        consumer_group: "dev-squad-qa"
+        filter: { type: "jira.issue.assigned", label: "qa" }
+    connector_config:
+      # api_key falls back to ANTHROPIC_API_KEY
+      model: "claude-opus-4-8"
+      system_prompt: |
+        You are a QA engineer. Your assigned discipline (backend, api, or
+        frontend) and the test target (a ticket's acceptance criteria, and
+        a PR branch when verifying a fresh build) are given in the task.
+        EXECUTE the test cases for your discipline — do NOT modify
+        production code or author new production tests; you VERIFY:
+          - backend  → run the service and its unit/integration suites; probe edge cases and error handling.
+          - api      → exercise the endpoints: status codes, response schema, auth, error paths, rate limits.
+          - frontend → drive the UI in a browser; check the user flows, console errors, basic accessibility.
+        For EVERY defect, record a clear title, steps to reproduce,
+        expected vs actual, and severity (blocker | major | minor). Then
+        return ONLY valid JSON:
+        {"qa_verdict": "pass|fail", "tests_run": 0, "bugs": [{"title": "", "steps": "", "expected": "", "actual": "", "severity": "major"}]}
+        Do not commit, push, or open PRs.
+      allowed_tools: ["Read", "Bash", "Glob", "Grep"]
+      permission_mode: "default"         # read + run only — QA never edits the repo
+      cwd: "${DEV_REPO_PATH:}"
+      max_turns: 30
+      timeout: 1200.0
+    yields:
+      ticket_id: "string"
+      pr_url: "string"
+      discipline: "string"
+      qa_verdict: "string"               # pass | fail
+      qa_escalate: "boolean"             # rework cap hit → a human steps in
+      from_dev_flow: "boolean"           # true = verifying a fresh PR; false = standalone test ticket
+      bugs_found: "list"
+      bugs_filed: "list"                 # Jira bug keys created
+      tests_run: "number"
+    inputs:
+      ticket_id: "string"
+      pr_url: "string"
+    can_call:
+      # Build verified clean → on to human judgment (the LLM reviewer)
+      - agent: "code_reviewer_agent"
+        condition: "calling_agent_response.qa_verdict == 'pass' and calling_agent_response.from_dev_flow == true"
+      # Build failed QA → back to the developer to fix (bounded rework)
+      - agent: "developer_agent"
+        condition: "calling_agent_response.qa_verdict == 'fail' and calling_agent_response.from_dev_flow == true and calling_agent_response.qa_escalate == false"
+      # Rework cap hit → a human breaks the loop
+      - agent: "tech_lead_human"
+        condition: "calling_agent_response.qa_escalate == true"
+      # Always log a failing round; standalone test tickets terminate at audit
+      # (the bugs filed to Jira are the output — the planner picks them up later)
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.qa_verdict == 'fail' or calling_agent_response.from_dev_flow == false"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── 4.4 CODE REVIEWER (LLM) ─────────────────────────────────────
+  code_reviewer_agent:
+    name: "code_reviewer_agent"
+    agent_type: "llm"
+    description: "Reads the PR diff and judges it — approve, request changes, or block; bounds the rework loop"
+    model: "claude-sonnet-4-6"
+    temperature: 0.1
+    max_completion_tokens: 3000
+    communication_type: "chain"
+    prompt: |
+      You review a pull request. context["prepared_data"] carries the PR
+      diff + the ticket/plan (pre_compose pulled them from GitHub).
+
+      Judge it:
+        - verdict: approve | changes | block
+          (block = a security hole, data-loss risk, or broken build;
+           changes = fixable issues; approve = ship-ready)
+        - findings: list of concrete issues
+        - requires_senior: true for cross-cutting / public-API / security
+      Your post-processor enforces the floor: a HIGH/security finding
+      forces is_blocker; cross-cutting forces requires_senior; and it
+      caps how many times a PR may bounce back to the developer.
+
+      Echo pr_url, ticket_id.
+
+      OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly
+      these keys:
+      {"pr_url": "", "ticket_id": "", "verdict": "", "findings": [], "requires_senior": false, "is_blocker": false}
+    enforce_yields: true
+    enforce_yields_retry: 1
+    yields:
+      pr_url: "string"
+      ticket_id: "string"
+      verdict: "string"
+      findings: "list"
+      requires_senior: "boolean"
+      is_blocker: "boolean"
+    inputs:
+      pr_url: "string"
+      ticket_id: "string"
+    can_call:
+      - agent: "tech_lead_human"
+        condition: "calling_agent_response.verdict == 'approve'"
+      - agent: "senior_engineer_human"
+        condition: "calling_agent_response.requires_senior == true"
+      - agent: "developer_agent"
+        condition: "calling_agent_response.verdict == 'changes' and calling_agent_response.requires_senior == false and calling_agent_response.is_blocker == false"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.is_blocker == true"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── HUMAN GATES ─────────────────────────────────────────────────
+  tech_lead_human:
+    name: "tech_lead_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Tech lead — signs off the plan, then approves the merge. Reply 'build' to start coding, 'replan' to revise, 'merge' to ship, 'reject' to drop"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 86400
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "hold_for_review"
+      message: "hold_for_review"
+      note: "Tech lead did not respond — held (no auto-build, no auto-merge)"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      ticket_key: "string"
+      ticket_url: "string"
+      plan: "string"
+      pr_url: "string"
+    can_call:
+      - agent: "developer_agent"
+        condition: "calling_agent_response.human_message == 'build'"
+      - agent: "dev_planner_agent"
+        condition: "calling_agent_response.human_message == 'replan'"
+      - agent: "merge_coordinator_agent"
+        condition: "calling_agent_response.human_message == 'merge'"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'hold_for_review'"
+
+  senior_engineer_human:
+    name: "senior_engineer_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Senior engineer — review escalations on cross-cutting / risky changes. Reply 'approve' to send to the lead for merge, 'request_changes' to send back to the developer"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 43200
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "hold_for_review"
+      message: "hold_for_review"
+      note: "Senior engineer did not respond — held"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      pr_url: "string"
+      findings: "list"
+    can_call:
+      - agent: "tech_lead_human"
+        condition: "calling_agent_response.human_message == 'approve'"
+      - agent: "developer_agent"
+        condition: "calling_agent_response.human_message == 'request_changes'"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.human_message != 'approve' and calling_agent_response.human_message != 'request_changes'"
+
+  stakeholder_human:
+    name: "stakeholder_human"
+    agent_type: "human"
+    is_human_powered: true
+    description: "Product stakeholder — signs off a groomed ticket's scope before it enters the dev queue. Reply 'approve' to queue it, 'revise' to re-groom, 'reject' to drop"
+    human_interface: "default"
+    communication_type: "dual"
+    human_timeout_seconds: 86400
+    fallback_on_timeout: true
+    fallback_response:
+      decision: "hold_for_review"
+      message: "hold_for_review"
+      note: "Stakeholder did not respond — held (ticket not queued)"
+    yields:
+      decision: "string"
+      notes: "string"
+    inputs:
+      ticket_key: "string"
+      title: "string"
+      acceptance_criteria: "list"
+    can_call:
+      - agent: "dev_planner_agent"
+        condition: "calling_agent_response.human_message == 'approve'"
+      - agent: "product_owner_agent"
+        condition: "calling_agent_response.human_message == 'revise'"
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.human_message == 'reject' or calling_agent_response.human_message == 'hold_for_review'"
+
+  # ── MERGE COORDINATOR — CI gate + the real merge ────────────────
+  merge_coordinator_agent:
+    name: "merge_coordinator_agent"
+    agent_type: "programmatic"
+    description: "CI gate + merge: checks CI is green, merges the PR, moves the ticket to Done in Jira, frees the WIP slot; red CI routes back to the developer"
+    communication_type: "chain"
+    yields:
+      pr_url: "string"
+      ticket_id: "string"
+      ticket_key: "string"
+      ci_status: "string"
+      merged: "boolean"
+      needs_fix: "boolean"
+    inputs:
+      pr_url: "string"
+      ticket_id: "string"
+    can_call:
+      - agent: "audit_logger_agent"
+        condition: "calling_agent_response.merged == true"
+      # CI red or no PR → back to the developer to fix (human-gated next merge)
+      - agent: "developer_agent"
+        condition: "calling_agent_response.needs_fix == true"
+    auto_store_response: true
+    auto_store_yields: true
+
+  # ── AUDIT (external WORM, terminal) ─────────────────────────────
+  audit_logger_agent:
+    name: "audit_logger_agent"
+    agent_type: "external"
+    description: "Hash-chained WORM — every plan, approval, PR, review, merge"
+    framework: "custom"
+    communication_type: "execute"
+    connector_config:
+      sink_type: "local_file"
+      local_file_path: "./logs/audit.jsonl"
+    yields:
+      audit_event_id: "string"
+      written_at_utc: "string"
+      hash_chain_prev: "string"
+      hash_chain_current: "string"
+    inputs:
+      session_id: "string"
+      payload: "object"
+    can_call: []
