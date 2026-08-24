@@ -25,10 +25,11 @@ tech lead still controls *what* gets built and merged, with bounded rework
 and a hash-chained audit keeping it safe. ROI: more throughput per
 engineer, shorter cycle time, fewer review round-trips.
 
-## The squad (10 agents)
+## The squad (11 agents)
 
 | Agent | Role | Responsibilities | Can perform |
 |---|---|---|---|
+| `squad_coordinator_agent` | Squad Coordinator (case owner) | Open the case on a new request, hand the verbatim ask to the product owner, keep live status, be the requester's single point of contact; escalate stalls to the tech lead — never grooms, codes, or approves | LLM (pure YAML); entry points `new_request` / `delivery_status`; routes to product_owner / tech_lead |
 | `product_owner_agent` | Product owner (upstream feeder) | Groom a raw request → well-formed ticket (testable acceptance criteria + priority + QA discipline); dedupe vs the backlog; file it as `triage` | LLM; `@pre_compose` (request + open titles), `@chain` (file ticket), tool `jira_update`; listens on `jira:created`; routes to stakeholder / audit |
 | `stakeholder_human` | Scope gate | Approve / revise / reject a groomed ticket's scope before it costs eng time | Human; routes to planner (approve) / PO (revise) / audit |
 | `dev_planner_agent` | Planner | Pull assigned tickets, pick the best, write the plan; directed-pick a stakeholder-approved ticket | LLM; `@pre_compose` (queue + directed), `@chain` (commit pick + WIP cap + Jira), tool `jira_update`; wake_up cron + `jira:assigned`; routes to tech_lead / audit |

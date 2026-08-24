@@ -30,6 +30,31 @@ def stash_put(session_id: str, data: dict[str, Any]) -> None:
         _STASH[session_id or "_nosession"] = dict(data)
 
 
+def stash_update(session_id: str, patch: dict[str, Any]) -> None:
+    """Merge `patch` into the session bucket (does NOT wipe rework counters /
+    claim markers, unlike stash_put which replaces the whole bucket)."""
+    sid = session_id or "_nosession"
+    with _LOCK:
+        _STASH.setdefault(sid, {}).update(patch)
+
+
+def claim(session_id: str, key: str) -> bool:
+    """ATOMIC one-shot claim within a session — True for the FIRST caller only.
+
+    The parallel QA testers (instances: N) share one session; the first copy to
+    claim a fresh PR (`claim(sid, "pr:<url>")`) verifies it, the others fall
+    through to the assigned-test backlog. In-process + under lock, so the N
+    copies in one process race safely."""
+    sid = session_id or "_nosession"
+    ck = f"__claim__:{key}"
+    with _LOCK:
+        bucket = _STASH.setdefault(sid, {})
+        if bucket.get(ck):
+            return False
+        bucket[ck] = True
+        return True
+
+
 def bump(session_id: str, key: str, by: int = 1) -> int:
     """Increment a counter and return the NEW value."""
     sid = session_id or "_nosession"

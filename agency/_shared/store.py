@@ -195,6 +195,30 @@ def qa_clear_in_flight(ticket_id: str) -> None:
         f = _load("qa_in_flight"); f.pop(ticket_id, None); _save("qa_in_flight", f)
 
 
+def claim_next_qa(discipline: str = "", assignee: str = QA_BOT) -> dict[str, Any]:
+    """ATOMIC backlog claim for the parallel QA testers (instances: N).
+
+    Under one lock: find the top open, not-in-flight QA ticket (optionally for a
+    discipline), mark it in-flight, and return it. Each concurrent instance that
+    calls this gets a DISJOINT ticket (LPOP-style) — so N copies never duplicate
+    work. Returns {} when the backlog is drained (that copy goes idle).
+    PROD: an atomic Jira transition (assign + move to In Progress) or a queue
+    `LPOP`/`UPDATE ... SKIP LOCKED RETURNING`."""
+    with _LOCK:
+        rows = [t for t in _qa_tickets().values()
+                if t.get("assignee") == assignee and t.get("status") == "open"]
+        if discipline:
+            rows = [t for t in rows if (t.get("discipline") or "backend") == discipline]
+        flying = set(_load("qa_in_flight").keys())
+        rows = [t for t in rows if t["ticket_id"] not in flying]
+        rows.sort(key=lambda t: _RANK.get(t.get("priority", "low"), 3))
+        if not rows:
+            return {}
+        pick = rows[0]
+        f = _load("qa_in_flight"); f[pick["ticket_id"]] = _now(); _save("qa_in_flight", f)
+        return pick
+
+
 def create_bug(summary: str, description: str = "", severity: str = "major",
                discipline: str = "backend", parent_key: str = "",
                reporter: str = "qa_agent") -> str:
@@ -216,3 +240,30 @@ def create_bug(summary: str, description: str = "", severity: str = "major",
 
 def get_bugs() -> dict[str, Any]:
     return _load("bugs")
+
+
+# ── Finisher recovery (post-HITL) + release ledger ───────────────────
+def put_under_review(session_id: str, pack: dict[str, Any]) -> None:
+    """Persist the PR/ticket under review so the merge finisher can recover it
+    AFTER the human merge gate (the SDK re-delivers only human-response meta —
+    the pr_url/ticket flowing through the chain is dropped). Dev fallback to the
+    in-process session stash; PROD: the Redis session store."""
+    if not session_id:
+        return
+    with _LOCK:
+        s = _load("under_review"); s[session_id] = {"stored_at": _now(), **pack}
+        _save("under_review", s)
+
+
+def get_under_review(session_id: str) -> dict[str, Any]:
+    return _load("under_review").get(session_id, {}) if session_id else {}
+
+
+def append_release_ledger(entry: dict[str, Any]) -> dict[str, Any]:
+    """Append-only release ledger (dev mirror of the WORM sink for local demo)."""
+    with _LOCK:
+        ledger = _load("release_ledger")
+        rows = ledger.get("rows", []) if isinstance(ledger, dict) else []
+        rec = {"recorded_at": _now(), **entry}; rows.append(rec)
+        _save("release_ledger", {"rows": rows})
+    return rec

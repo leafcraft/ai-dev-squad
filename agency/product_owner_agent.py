@@ -37,6 +37,14 @@ def load_request_context(data: Any, ctx: Any) -> dict[str, Any]:
     req = ""
     if isinstance(data, dict):
         req = str(data.get("request") or data.get("human_message") or "")
+        if not req:                                  # the coordinator hands the case here
+            uy = data.get("upstream_yields")
+            if isinstance(uy, dict):
+                req = str(uy.get("request") or "")
+                if not req:
+                    for v in uy.values():
+                        if isinstance(v, dict) and v.get("request"):
+                            req = str(v["request"]); break
         if not req:
             owd = data.get("original_webhook_data")
             if isinstance(owd, dict):

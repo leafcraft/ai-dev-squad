@@ -72,6 +72,16 @@ async def route_review(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
         if rounds > _MAX_REWORK_ROUNDS:
             result["requires_senior"] = True   # stop looping — escalate to a human
             logger.warning(f"[review] rework cap hit ({rounds}) — escalating to senior")
+    # When this PR heads to a human merge gate (approve → tech lead, or
+    # requires_senior → senior), stash the PR/ticket so the merge FINISHER can
+    # recover it after the gate (the SDK re-delivers only human-response meta).
+    if result.get("verdict") == "approve" or result.get("requires_senior"):
+        sid = _sid(result, ctx if isinstance(ctx, dict) else {})
+        pack = {"pr_url": result.get("pr_url", ""), "ticket_id": result.get("ticket_id", "")}
+        tk = store.get_ticket(result.get("ticket_id", "")) if result.get("ticket_id") else {}
+        pack["ticket_key"] = tk.get("key", "") if isinstance(tk, dict) else ""
+        session_stash.stash_update(sid, pack)
+        store.put_under_review(sid, pack)
     return result
 
 

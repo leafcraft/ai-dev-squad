@@ -1,19 +1,29 @@
-"""qa_agent — Jira-driven QA engineer (Claude Agent SDK executor).
+"""qa_agent — Jira-driven QA engineer (Claude Agent SDK executor), FANNED.
 
-@pre_compose  load_test_target — assemble what to test: an inline fresh
-              PR (when the developer just handed off ticket_id + pr_url),
-              or, standalone, the top QA/test ticket assigned to this
-              discipline pulled from Jira (dev: the store). The discipline,
-              acceptance criteria, and PR branch become the SDK run prompt.
-Shaper        qa_agent(connector_result, ...) — map the SDK's verdict into
-              yields, FILE every defect as a Jira bug (deterministic — the
-              run's job is to test, the shaper guarantees the bugs land),
-              and bound the qa⇄developer rework loop.
+Runs as N PARALLEL testers (config: instances: 3, instances_handoff: each).
+Each copy makes an ATOMIC claim in pre_compose so copies never duplicate work:
 
-QA never edits the repo (permission_mode: default — no Write/Edit): it
-VERIFIES and reports. The bugs it files become new Jira tickets the
-planner later picks up — that's how the squad closes the find→fix loop.
-Discipline comes from QA_DISCIPLINE (backend | api | frontend).
+  * a fresh PR (developer hand-off) is claimed by exactly ONE copy
+    (session_stash.claim) — that copy verifies the build; the others fall
+    through and drain the assigned-test backlog.
+  * standalone copies each atomically pop the next assigned QA/test ticket
+    (store.claim_next_qa) — disjoint tickets, real parallelism by discipline.
+  * a copy that claims nothing goes IDLE (did_work=false, route="") — it routes
+    NOWHERE, so an empty tester never emits a spurious audit entry.
+
+Because instances_handoff is `each`, every copy routes its OWN result through
+the single computed `route` field — there is no cross-copy merge, so none of the
+number-sum / last-wins merge footguns apply.
+
+@pre_compose  load_test_target — claim the work + assemble the SDK run brief.
+Shaper        qa_agent(connector_result, …) — map the SDK verdict into yields,
+              FILE every defect as a Jira bug (deterministic), bound the
+              qa⇄developer rework loop, and compute `route`.
+
+QA never edits the repo (permission_mode: default — no Write/Edit): it VERIFIES
+and reports. The bugs it files become new Jira tickets the planner later picks
+up — that's how the squad closes the find→fix loop. Discipline comes from
+QA_DISCIPLINE (backend | api | frontend).
 """
 from __future__ import annotations
 from typing import Any
@@ -29,6 +39,7 @@ _MAX_REWORK_ROUNDS = 3
 _DEFAULTS: dict[str, Any] = {
     "ticket_id": "", "pr_url": "", "discipline": _DISCIPLINE,
     "qa_verdict": "", "qa_escalate": False, "from_dev_flow": False,
+    "did_work": False, "route": "",
     "bugs_found": [], "bugs_filed": [], "tests_run": 0,
 }
 
@@ -61,22 +72,33 @@ def _sid(data: Any, context: Any) -> str:
 
 
 def load_test_target(data: Any, ctx: Any) -> dict[str, Any]:
-    """Build the test brief the SDK runs against — inline PR or standalone ticket."""
+    """Claim ONE unit of work for THIS tester copy, then build the test brief.
+
+    Ordering: a fresh PR (claimed once across the copies) beats the backlog, so
+    the developer's hand-off is always verified before idle testers drain
+    tickets. A copy that claims nothing returns mode="idle"."""
+    sid = _sid(data, ctx if isinstance(ctx, dict) else {})
     pr = str(_pick(data, "pr_url") or "")
     tid = str(_pick(data, "ticket_id") or "")
-    if pr or tid:                                  # inline — verify the fresh build
-        t = store.get_ticket(tid) if tid else {}
-        return {"mode": "pr", "discipline": _DISCIPLINE, "pr_url": pr,
-                "ticket": t, "acceptance_criteria": t.get("acceptance_criteria", []),
-                "from_dev_flow": True}
-    # standalone — pick the top assigned QA/test ticket for this discipline
-    queue = store.qa_assigned(discipline=_DISCIPLINE)
-    pick = queue[0] if queue else {}
-    if pick:
-        store.qa_mark_in_flight(pick["ticket_id"])
+
+    # Inline fresh PR — exactly one copy claims it and verifies the build.
+    if pr or tid:
+        if session_stash.claim(sid, f"pr:{pr or tid}"):
+            t = store.get_ticket(tid) if tid else {}
+            return {"mode": "pr", "discipline": _DISCIPLINE, "pr_url": pr,
+                    "ticket": t, "acceptance_criteria": t.get("acceptance_criteria", []),
+                    "from_dev_flow": True, "did_work": True}
+        # Lost the PR race → this copy drains the backlog instead (fall through).
+
+    # Standalone — atomically claim the next assigned QA/test ticket.
+    pick = store.claim_next_qa(discipline=_DISCIPLINE)
+    if not pick:
+        return {"mode": "idle", "discipline": _DISCIPLINE, "pr_url": "",
+                "ticket": {}, "acceptance_criteria": [],
+                "from_dev_flow": False, "did_work": False}
     return {"mode": "ticket", "discipline": _DISCIPLINE, "pr_url": "",
             "ticket": pick, "acceptance_criteria": pick.get("acceptance_criteria", []),
-            "from_dev_flow": False}
+            "from_dev_flow": False, "did_work": True}
 
 
 def _parse(resp: Any) -> dict[str, Any]:
@@ -112,12 +134,19 @@ def _file_bugs(bugs: list[Any], discipline: str, parent_key: str) -> list[str]:
 async def qa_agent(connector_result: Any, input_data: Any, context: Any) -> dict[str, Any]:
     out = {**_DEFAULTS}
     pd = _prepared(context)
+    did_work = bool(pd.get("did_work"))
+
+    # Idle copy — claimed nothing. Route NOWHERE (terminal, no spurious audit).
+    if not did_work:
+        logger.info(f"[qa:{_DISCIPLINE}] idle — no work to claim (route='')")
+        return out
+
     tk = pd.get("ticket") if isinstance(pd.get("ticket"), dict) else {}
-    pr = str(_pick(input_data, "pr_url") or pd.get("pr_url") or "")
-    tid = str(_pick(input_data, "ticket_id") or (tk.get("ticket_id") if tk else "") or "")
-    from_dev_flow = bool(pd["from_dev_flow"]) if isinstance(pd.get("from_dev_flow"), bool) else bool(pr or tid)
+    pr = str(pd.get("pr_url") or _pick(input_data, "pr_url") or "")
+    tid = str((tk.get("ticket_id") if tk else "") or _pick(input_data, "ticket_id") or "")
+    from_dev_flow = bool(pd.get("from_dev_flow"))
     parent = (store.get_ticket(tid).get("key", "") if tid else "") or (tk.get("key", "") if tk else "")
-    out.update({"ticket_id": tid, "pr_url": pr, "from_dev_flow": from_dev_flow})
+    out.update({"ticket_id": tid, "pr_url": pr, "from_dev_flow": from_dev_flow, "did_work": True})
 
     if isinstance(connector_result, dict) and connector_result:
         text = str(connector_result.get("result") or connector_result.get("text") or "")
@@ -139,7 +168,7 @@ async def qa_agent(connector_result: Any, input_data: Any, context: Any) -> dict
     else:
         # Dev stub — no SDK/repo: pass with no bugs so the chain runs.
         out["qa_verdict"] = "pass"
-        logger.info(f"[qa] DEV STUB — would run {_DISCIPLINE} test cases via the Claude Agent SDK")
+        logger.info(f"[qa:{_DISCIPLINE}] DEV STUB — would run test cases via the Claude Agent SDK")
 
     # Bound the qa⇄developer rework loop (only the inline fresh-PR path loops).
     if out["qa_verdict"] == "fail" and from_dev_flow:
@@ -147,7 +176,7 @@ async def qa_agent(connector_result: Any, input_data: Any, context: Any) -> dict
                                     f"qa_rework:{pr or tid}")
         if rounds > _MAX_REWORK_ROUNDS:
             out["qa_escalate"] = True
-            logger.warning(f"[qa] rework cap hit ({rounds}) — escalating to the tech lead")
+            logger.warning(f"[qa:{_DISCIPLINE}] rework cap hit ({rounds}) — escalating to the tech lead")
 
     # Lifecycle: a failing QA on a PR sends the ticket back to In Progress;
     # a standalone test ticket frees its slot when done.
@@ -155,6 +184,18 @@ async def qa_agent(connector_result: Any, input_data: Any, context: Any) -> dict
         store.set_status(parent, "In Progress" if out["qa_verdict"] == "fail" else "In Review")
     if not from_dev_flow and tid:
         store.qa_clear_in_flight(tid)
-    logger.info(f"[qa] {_DISCIPLINE} verdict={out['qa_verdict']} "
+
+    # Compute the SINGLE routing signal (instances_handoff: each → per-copy).
+    if from_dev_flow:
+        if out["qa_verdict"] == "pass":
+            out["route"] = "reviewer"
+        elif out["qa_escalate"]:
+            out["route"] = "escalate"
+        else:
+            out["route"] = "developer"
+    else:
+        out["route"] = "audit"   # standalone test ticket — bugs filed are the output
+
+    logger.info(f"[qa:{_DISCIPLINE}] verdict={out['qa_verdict']} route={out['route']} "
                 f"bugs={len(out['bugs_found'])} filed={out['bugs_filed'] or '-'}")
     return out
