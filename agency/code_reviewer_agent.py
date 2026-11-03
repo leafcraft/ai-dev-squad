@@ -6,6 +6,14 @@
               requires_senior; AND cap how many times one PR may bounce
               back to the developer (the reviewer⇄developer cycle bound —
               lesson from the finance/outbound loops).
+
+The four routes are exhaustive and exclusive (config can_call):
+  is_blocker                                  → audit (never merged)
+  not blocker, requires_senior                → senior_engineer_human
+  not blocker, not senior, verdict approve    → tech_lead_human (merge gate)
+  not blocker, not senior, verdict changes    → developer_agent (bounded)
+So the floor normalises the verdict to approve | changes | block, and a
+'block' verdict always sets is_blocker.
 """
 from __future__ import annotations
 from typing import Any
@@ -22,6 +30,7 @@ _DEFAULTS: dict[str, Any] = {
     "requires_senior": False, "is_blocker": False,
 }
 _HIGH = ("security", "secret", "sql injection", "data loss", "rce", "broken build", "credential")
+_VERDICTS = ("approve", "changes", "block")
 
 
 def load_pr_diff(data: Any, ctx: Any) -> dict[str, Any]:
@@ -59,6 +68,12 @@ def _sid(input_data: Any, context: Any) -> str:
 
 
 async def route_review(result: dict[str, Any], ctx: Any) -> dict[str, Any]:
+    # An unknown verdict ("request_changes", "lgtm?") is not an approval.
+    if str(result.get("verdict") or "").lower() not in _VERDICTS:
+        result["verdict"] = "changes"
+    result["verdict"] = str(result["verdict"]).lower()
+    if result["verdict"] == "block":
+        result["is_blocker"] = True
     findings = result.get("findings") or []
     blob = " ".join(str(f) for f in findings).lower()
     # Floor: security/HIGH → blocker; never auto-approvable.

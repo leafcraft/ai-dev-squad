@@ -8,10 +8,10 @@
 # and does the real merge -> a WORM sink records every step.
 #
 # The pod is a TEAM, not a pipeline. Every wire is conditional; every hand-off is
-# a finished contract; every human gate default-denies on silence (-> held ->
-# audit); the finisher re-checks the human approval and fails closed; the WORM
-# sink is the terminus. Systems (Jira / GitHub) are TOOLS inside agents, never
-# members.
+# a finished contract; no human gate approves on silence (nothing is built or
+# merged without a person's answer); the finisher re-checks the human approval
+# and fails closed; the WORM sink is the terminus of every decision. Systems
+# (Jira / GitHub) are TOOLS inside agents, never members.
 #
 # Design doctrine: .claude/skills/leafmesh/building-agents-thoroughly.md
 # Field reference:  .claude/skills/leafmesh/agent-config-fields.md
@@ -23,48 +23,47 @@ environment: "development"
 debug: true
 log_level: "INFO"
 
-persistence:
-  backend: redis
-  redis:
-    host: "${REDIS_HOST:localhost}"
-    port: ${REDIS_PORT:6379}
-    db: 0
-    password: "${REDIS_PASSWORD:}"
-    auto_storage: true
-    decode_responses: true
-    default_ttl: 86400
-    session_ttl: 1209600          # 14d — tickets are long-lived
-
 # ─────────────────────────────────────────────────────────────────────
 # EVENT BROKERS — where Jira pushes events the squad listens to.
 # DEV: a thin webhook receiver writes Jira "issue assigned to us" events
 # into a Redis stream (same Redis, no extra dependency). PROD: point at
-# your real bus (Kafka / SQS) — uncomment one and `pip install
-# leafmesh[kafka]` or `[sqs]`.
+# your real bus (Kafka / SQS) — uncomment one (here before the first start, in
+# Studio's YAML editor after it) and `pip install leafmesh[kafka]` or `[sqs]`.
 # ─────────────────────────────────────────────────────────────────────
-brokers:
-  jira_events:
-    type: "redis_streams"
-    url: "${JIRA_EVENTS_REDIS_URL:redis://localhost:6379}"
-    db: 1
-  # PROD — Jira webhooks → SQS:
+# brokers:
+  # Day 0 this broker is off: create the vault connection 'jira_events' on
+  # Infrastructure → Brokers & queues → Redis Streams, then uncomment it and
+  # its agents' listen_events — here before the first start, in Studio's YAML
+  # editor after it (applies live, no restart).
+  # jira_events:
+    # type: "redis_streams"
+    # connection: jira_events   # vault connection (Infrastructure → Brokers & queues → Redis Streams) holds the address
+    # db: 1
+  # PROD — Jira webhooks → SQS (signs in with the deployment's AWS identity;
+  # for explicit keys / a LocalStack endpoint add a vault connection and
+  # `connection: jira_events`). The queue goes on each listen_events (`queue:`).
   # jira_events:
   #   type: "sqs"
-  #   region: "${AWS_REGION:us-east-1}"
-  # PROD — Jira webhooks → Kafka:
+  #   region: "us-east-1"
+  # PROD — Jira webhooks → Kafka (bootstrap servers + sign-in live in the
+  # vault connection 'jira_events', a Kafka connection):
   # jira_events:
   #   type: "kafka"
-  #   bootstrap_servers: ["${KAFKA_BOOTSTRAP:kafka:9092}"]
+  #   connection: jira_events
 
 auto_discover:
   directory: "./agency"
   pattern: "*_agent.py"
   recursive: false
 
-# The Manager is the SUPERVISOR — it watches every hand-off and escalates stalls
-# / contract violations / repeated errors to the Tech Lead. It is NOT a router in
-# the middle of the team (static routing keeps the mesh's own can_call wires in
-# charge; the Manager only intervenes on trouble).
+# The Manager is the SUPERVISOR — it watches every hand-off and escalates to the
+# Tech Lead only when (leafmesh 2.4.486): an agent hits an error retrying cannot
+# fix (auth, bad request, out of credit, bad config); max_errors_per_session
+# different agents fail in one session; or an agent's restarts are used up. A
+# gate nobody answers is NOT escalated, and a broken output contract only
+# ALERTS people. The squad's own loops (QA / review / CI rework) escalate to the
+# Tech Lead through their can_call wires at the rework cap. It is NOT a router
+# in the middle of the team (static routing keeps the can_call wires in charge).
 manager:
   model: "gpt-4o-mini"
   domain: "generic"
@@ -75,10 +74,11 @@ manager:
     picks & plans -> tech_lead approves -> developer (Claude Agent SDK) builds
     it -> qa RE-RUNS the tests independently -> code_reviewer judges the diff ->
     tech_lead merges -> merge_coordinator gates CI and does the real merge.
-    Escalate to the Tech Lead when: a plan sits unreviewed past its bound, a PR
-    bounces between reviewer/QA and the developer past the rework cap, the
-    developer run fails to produce a PR, or any agent hands off a malformed
-    artifact. Silence never advances a ticket.
+    The squad's own wires already send a PR that hits the rework cap (3 rounds)
+    and a developer run with no PR to the Tech Lead. Escalate to the Tech Lead
+    when an agent fails with an error retrying cannot fix, or when several
+    agents fail on the same ticket. A gate nobody answers is not escalated: it
+    waits its time and closes unanswered. Silence never advances a ticket.
   routing:
     mode: static
   escalation:
@@ -87,16 +87,15 @@ manager:
         agent: tech_lead_human
     auto_escalate:
       max_retries: 3
-      max_errors_per_session: 5
-      timeout_threshold: 2
-
-mesh:
-  call_timeout: 1800            # the developer run is long
+      # 3 different agents failing on one ticket is systemic (repo, CI or
+      # credentials), not a flaky step — the Tech Lead looks.
+      max_errors_per_session: 3
 
 # 2.4.131 runtime block — the developer/QA runs are external (own timeouts in
 # connector_config); the LLM agents (planner with super_agent, reviewer) can run
 # long, so lift the LLM hard timeout off the 2.4.131 default of 90s.
 timeouts:
+  mesh_call_default_timeout_s: 1800            # the developer run is long
   llm_hard_timeout_s: 300
 
 data_structures:
@@ -199,9 +198,10 @@ agents:
       On a new request: open a case and hand the verbatim request to the product
       owner to groom. Echo the request text in `request` so the product owner
       receives it. On a status ask: answer the current stage / waiting-on / next
-      gate from the case record — nothing invented. If a specialist raises an
-      exception you cannot route (a stalled gate, a malformed hand-off), escalate
-      to the Tech Lead; never make the engineering call yourself.
+      gate from what you are given — nothing invented; if you do not know the
+      stage, say so. If the requester raises something you cannot route (a
+      blocked ticket, a hand-off that went wrong), set action "escalate" for the
+      Tech Lead; never make the engineering call yourself.
 
       OUTPUT CONTRACT — respond with ONLY valid JSON containing exactly these keys:
       {"action": "open_case", "request": "", "ticket_ref": "", "stage": "", "waiting_on": "", "summary": ""}
@@ -237,11 +237,11 @@ agents:
     communication_type: "chain"
     # Hear raw tickets created in Jira that need grooming — parallel to the
     # new_request entry point a stakeholder / intake form posts to.
-    listen_events:
-      - broker: "jira_events"
-        stream: "jira:created"
-        consumer_group: "dev-squad-po"
-        filter: { type: "jira.issue.created" }
+    # listen_events:
+      # - broker: "jira_events"
+        # stream: "jira:created"
+        # consumer_group: "dev-squad-po"
+        # filter: { type: "jira.issue.created" }
     prompt: |
       You are the product owner for a software squad.
       context["prepared_data"] carries the raw request and the titles of
@@ -287,21 +287,22 @@ agents:
     # Day-0 write tool — the LLM comments the groomed ticket onto Jira as it
     # works. The @chain guarantees the create regardless (dev: the store).
     tools: ["jira_update"]
-    # ── To wire real Jira, set the URL and uncomment. NOTE: the SDK rejects an
-    #    http mcp block with an EMPTY url at load, so this ships commented —
-    #    fill JIRA_MCP_URL, then uncomment. Each named action under `use:`
+    # ── To wire real Jira: create the vault connection 'jira_mcp' (the Jira
+    #    MCP server's URL + token) on Infrastructure → Integrations → MCP, then
+    #    uncomment — here before the first start, in Studio's YAML editor after
+    #    it (applies live, no restart). The address and token live only in the vault (an inline
+    #    url/token is refused at load). Each named action under `use:`
     #    becomes its own tool (e.g. jira_create_issue). ──
     # mcp:
-    #   - transport: http
-    #     url: "${JIRA_MCP_URL}"
-    #     token: "${JIRA_MCP_TOKEN:}"
+    #   - connection: jira_mcp
+    #     transport: http
     #     use: [create_issue, add_comment, search_issues]
     #     name: jira
     #     timeout: 30
     yields:
       title: "string"
       description: "string"
-      acceptance_criteria: "list"
+      acceptance_criteria: {type: array, items: string}   # one executable check each
       priority: "string"
       discipline: "string"
       ticket_ready: "boolean"
@@ -315,8 +316,11 @@ agents:
     can_call:
       - agent: "stakeholder_human"
         condition: "calling_agent_response.ticket_ready == true and calling_agent_response.duplicate_of == ''"
+      # Everything else — a duplicate, too vague, or no title — is logged, not
+      # filed. (The exact complement of the route above, so no request ends
+      # without a record.)
       - agent: "audit_logger_agent"
-        condition: "calling_agent_response.not_actionable == true or calling_agent_response.duplicate_of != ''"
+        condition: "calling_agent_response.ticket_ready != true or calling_agent_response.duplicate_of != ''"
     auto_store_response: true
     auto_store_yields: true
 
@@ -333,16 +337,18 @@ agents:
     max_completion_tokens: 3000
     max_tool_calls_per_message: 15   # queue reads + planner tools + playbook; default 5 truncates silently
     communication_type: "chain"
-    # Scheduled poll — every 30 min, in the company timezone (NOT UTC). Also
+    # Scheduled poll — every 30 min in working hours (09:00–18:30, Mon–Fri),
+    # in the company timezone (NOT UTC). A plan needs the Tech Lead's sign-off
+    # anyway, so polling at night would only queue plans nobody reads. Also
     # reachable via ticket_assigned / poll_assigned_tickets entry points.
-    wake_up: "*/30 * * * *"
+    wake_up: "*/30 9-18 * * 1-5"
     timezone: "Asia/Kolkata"
     # ALSO hear Jira live — event-driven, parallel to the cron + entry point.
-    listen_events:
-      - broker: "jira_events"
-        stream: "jira:assigned"
-        consumer_group: "dev-squad-planner"
-        filter: { type: "jira.issue.assigned" }   # CloudEvents-style; squad-assigned only
+    # listen_events:
+      # - broker: "jira_events"
+        # stream: "jira:assigned"
+        # consumer_group: "dev-squad-planner"
+        # filter: { type: "jira.issue.assigned" }   # CloudEvents-style; squad-assigned only
     # super_agent — DICT form (the tuning path). Registers the planner tools
     # from THIS block; do not list them under `tools:`.
     super_agent:
@@ -394,11 +400,11 @@ agents:
       serviceName: "mongo_main"
       enabled: true
       groupName: "eng_playbook"
-    # ── Real Jira MCP — ships commented (empty-url mcp is rejected at load). ──
+    # ── Real Jira MCP — create vault connection 'jira_mcp', then uncomment (here
+    #    before the first start, in Studio's YAML editor after it). ──
     # mcp:
-    #   - transport: http
-    #     url: "${JIRA_MCP_URL}"
-    #     token: "${JIRA_MCP_TOKEN:}"
+    #   - connection: jira_mcp
+    #     transport: http
     #     use: [search_issues, get_issue, transition_issue, add_comment]
     #     name: jira
     #     timeout: 30
@@ -471,10 +477,10 @@ agents:
   # tickets (standalone, via Jira event/cron) and files every defect back
   # into Jira as a bug — which the planner later picks up (find→fix loop).
   #
-  # PARALLEL INSTANCES — one activation spins up N testers. Each copy makes an
+  # PARALLEL COPIES (scaling.copies) — one activation spins up N testers. Each copy makes an
   # ATOMIC claim in pre_compose (a fresh PR is claimed by exactly one; the
   # others drain the assigned-test backlog), so copies never duplicate work.
-  # instances_handoff: each = every copy routes its OWN result (no cross-copy
+  # copies.handoff: each = every copy routes its OWN result (no cross-copy
   # merge footgun) via the single computed `route` field.
   qa_agent:
     name: "qa_agent"
@@ -482,16 +488,21 @@ agents:
     framework: "claude_agent"
     description: "QA engineer — pulls its assigned test tickets (and tests fresh PRs), runs the test cases for its discipline, files bugs back into Jira; runs as N parallel testers"
     communication_type: "chain"
-    instances: 3                       # 3 parallel testers per activation
-    instances_handoff: each            # each copy routes its own result (disjoint work)
-    wake_up: "*/45 * * * *"            # sweep the assigned QA/test queue
+    scaling:                      # 2.4.484 (was instances / instances_handoff)
+      copies:
+        mode: fixed
+        count: 3                       # 3 parallel testers per activation
+        handoff: each            # each copy routes its own result (disjoint work)
+    # Sweep the assigned QA/test queue every 30 min in working hours, offset
+    # 15 min from the planner. (The old "*/45" fired at :00 and :45 only.)
+    wake_up: "15,45 9-18 * * 1-5"
     timezone: "Asia/Kolkata"
     # Hear Jira assign QA/test tickets live (label: qa), parallel to cron.
-    listen_events:
-      - broker: "jira_events"
-        stream: "jira:qa_assigned"
-        consumer_group: "dev-squad-qa"
-        filter: { type: "jira.issue.assigned", label: "qa" }
+    # listen_events:
+      # - broker: "jira_events"
+        # stream: "jira:qa_assigned"
+        # consumer_group: "dev-squad-qa"
+        # filter: { type: "jira.issue.assigned", label: "qa" }
     connector_config:
       # api_key falls back to ANTHROPIC_API_KEY
       model: "claude-opus-4-8"
@@ -514,20 +525,10 @@ agents:
       cwd: "${DEV_REPO_PATH:}"
       max_turns: 30
       timeout: 1200.0
-    # ── Real Jira/GitHub MCP — ships commented (empty-url mcp rejected at load). ──
-    # mcp:
-    #   - transport: http
-    #     url: "${JIRA_MCP_URL}"
-    #     token: "${JIRA_MCP_TOKEN:}"
-    #     use: [search_issues, get_issue, create_issue]
-    #     name: jira
-    #     timeout: 30
-    #   - transport: http
-    #     url: "${GITHUB_MCP_URL}"
-    #     token: "${GITHUB_MCP_TOKEN:}"
-    #     use: [get_pull_request, get_pr_files]
-    #     name: github
-    #     timeout: 30
+    # No `mcp:` here: this is an external claude_agent, and the SDK refuses
+    # `mcp:` on an external agent at load. QA's Jira reads and bug filing go
+    # through agency/_shared/store.py (the pre_compose + shaper) — replace
+    # those store functions to reach real Jira/GitHub.
     yields:
       ticket_id: "string"
       pr_url: "string"
@@ -605,29 +606,32 @@ agents:
           4. Everything else fixable is `changes` with concrete findings — the
              developer must be able to act on each one.
         variables: [pr_url]
-    # ── Real GitHub MCP — ships commented (empty-url mcp rejected at load). ──
+    # ── Real GitHub MCP — create vault connection 'github_mcp', then uncomment
+    #    (here before the first start, in Studio's YAML editor after it). ──
     # mcp:
-    #   - transport: http
-    #     url: "${GITHUB_MCP_URL}"
-    #     token: "${GITHUB_MCP_TOKEN:}"
+    #   - connection: github_mcp
+    #     transport: http
     #     use: [get_pull_request, get_pr_diff, get_pr_files]
     #     name: github
     #     timeout: 30
     yields:
       pr_url: "string"
       ticket_id: "string"
-      verdict: "string"
-      findings: "list"
+      verdict: "string"         # approve | changes | block (the floor normalises)
+      findings: {type: array, items: string}   # one concrete, actionable issue each
       requires_senior: "boolean"
       is_blocker: "boolean"
     inputs:
       pr_url: "string"
       ticket_id: "string"
+    # Exhaustive and exclusive (route_review normalises verdict and sets
+    # is_blocker on 'block'): exactly one person or agent gets each review, so
+    # a PR is never sent to two merge approvers at once.
     can_call:
       - agent: "tech_lead_human"
-        condition: "calling_agent_response.verdict == 'approve'"
+        condition: "calling_agent_response.verdict == 'approve' and calling_agent_response.requires_senior == false and calling_agent_response.is_blocker == false"
       - agent: "senior_engineer_human"
-        condition: "calling_agent_response.requires_senior == true"
+        condition: "calling_agent_response.requires_senior == true and calling_agent_response.is_blocker == false"
       - agent: "developer_agent"
         condition: "calling_agent_response.verdict == 'changes' and calling_agent_response.requires_senior == false and calling_agent_response.is_blocker == false"
       - agent: "audit_logger_agent"
@@ -636,11 +640,18 @@ agents:
     auto_store_yields: true
 
   # ─────────────────────────────────────────────────────────────────────────
-  # HUMAN MEMBERS — first-class, reached in the channel they already live in.
-  # Every gate DEFAULT-DENIES on timeout (fallback -> held -> audit). dual
-  # belongs on the human/webhook boundary agents; NO human calls another human
-  # (that would be a dual↔dual auto-bounce) — silence/hold routes to the audit
-  # sink and the Manager SUPERVISOR escalates.
+  # HUMAN MEMBERS — first-class, answering in Studio's Inbox. dual belongs on
+  # the human/webhook boundary agents; NO human calls another human (that
+  # would be a dual↔dual auto-bounce).
+  #
+  # SILENCE (leafmesh 2.4.486): a dual seat's timeout routes nothing. When
+  # nobody answers within human_timeout_seconds, the request waits no longer:
+  # its Inbox card closes and the ticket records that no reply came. Nothing
+  # is built, queued or merged on silence, and nobody is chased automatically
+  # (the Manager does not escalate an unanswered gate). Each seat's
+  # fallback_response (held_for_review, which matches its audit route) is the
+  # declared intent, kept so the route is ready if the SDK starts sending a
+  # dual seat's fallback on. It does not route today.
   # ─────────────────────────────────────────────────────────────────────────
   tech_lead_human:
     name: "tech_lead_human"
@@ -649,7 +660,7 @@ agents:
     description: "Tech lead — signs off the plan, then approves the merge. Reply 'build' to start coding, 'replan' to revise, 'merge' to ship, 'reject' to drop"
     human_interface: "default"
     communication_type: "dual"
-    human_timeout_seconds: 86400
+    human_timeout_seconds: 86400       # one business day for a plan or merge decision
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
@@ -677,10 +688,10 @@ agents:
     name: "senior_engineer_human"
     agent_type: "human"
     is_human_powered: true
-    description: "Senior engineer — review escalations on cross-cutting / risky changes. Reply 'approve' to send it to the merge finisher, 'request_changes' to send back to the developer"
+    description: "Senior engineer — review escalations on cross-cutting / risky changes. Reply 'approve' to send it to the merge finisher, 'request_changes' to send back to the developer, 'reject' to drop the PR"
     human_interface: "default"
     communication_type: "dual"
-    human_timeout_seconds: 43200
+    human_timeout_seconds: 86400       # one business day, the same as the tech lead (was 12 h)
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
@@ -710,7 +721,7 @@ agents:
     description: "Product stakeholder — signs off a groomed ticket's scope before it enters the dev queue. Reply 'approve' to queue it, 'revise' to re-groom, 'reject' to drop"
     human_interface: "default"
     communication_type: "dual"
-    human_timeout_seconds: 86400
+    human_timeout_seconds: 172800      # two business days — product managers triage scope in batches
     fallback_on_timeout: true
     fallback_response:
       human_decision: "held"
@@ -779,9 +790,9 @@ agents:
   audit_logger_agent:
     name: "audit_logger_agent"
     agent_type: "external"
-    description: "Hash-chained WORM — every plan, approval, PR, review, merge, and held gate. Terminus"
+    description: "Hash-chained WORM — every rejected or duplicate request, empty queue, blocked review, standalone QA result, merge and blocked merge. Terminus"
     framework: "custom"
-    communication_type: "execute"
+    communication_type: "chain"
     connector_config:
       sink_type: "local_file"
       local_file_path: "./logs/audit.jsonl"
