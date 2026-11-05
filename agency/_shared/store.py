@@ -2,11 +2,19 @@
 
 Stands in for Jira (tickets + status) and GitHub (PR diff, CI, merge) so
 the planner→lead→build→review→merge loop runs before connectors are
-wired. Replace each read/write with the matching MCP connector in prod;
-the function signatures are the contract. The two integration points:
-  * Jira   → wire ${JIRA_MCP_URL}   into the ticket read/write + create_bug
-  * GitHub → wire ${GITHUB_MCP_URL} into get_pr_diff / get_ci_status / merge_pr
-Setting those env vars alone does nothing until you wire the calls here.
+wired. Replace each read/write with the matching call in prod; the function
+signatures are the contract. The two integration points:
+  * Jira   → the ticket read/write + create_bug functions
+  * GitHub → get_pr_diff / get_ci_status / merge_pr
+Creating the vault records 'jira_mcp' / 'github_mcp' gives the LLM agents
+live tools (their `mcp:` blocks); it does not change this file. Until you
+replace these bodies, tickets, diffs and CI come from here. Nothing reads an
+address or token from .env.
+
+Seed data is fictional (a mid-size online retailer's engineering team) and
+covers every route: an open queue ordered by priority then age, a blocked
+ticket, a needs-info ticket, a PR with green CI and one with red CI, and QA
+tickets for each discipline.
 """
 from __future__ import annotations
 import json, threading
@@ -18,16 +26,56 @@ _LOCK = threading.Lock()
 _DIR = Path("./data")
 SQUAD = "dev-squad-bot"
 
+JIRA_BASE = "https://jira.example.com/browse"   # fictional; your Jira's browse URL
+# est_effort is story points (Fibonacci). created_at decides "oldest first".
 _SEED = [
-    {"ticket_id": "t1", "key": "ENG-1201", "url": "https://jira.example/ENG-1201",
-     "title": "Add rate-limit headers to public API", "priority": "high",
-     "status": "open", "assignee": SQUAD, "est_effort": 3},
-    {"ticket_id": "t2", "key": "ENG-1188", "url": "https://jira.example/ENG-1188",
+    {"ticket_id": "t1", "key": "ENG-1201", "url": f"{JIRA_BASE}/ENG-1201",
+     "title": "Add rate-limit headers to the public orders API", "priority": "high",
+     "status": "open", "assignee": SQUAD, "est_effort": 3, "discipline": "api",
+     "created_at": "2026-10-21T09:12:00+00:00",
+     "description": "Partners hit 429s with no hint of when to retry.",
+     "acceptance_criteria": [
+         "GET /v2/orders returns X-RateLimit-Limit, X-RateLimit-Remaining and X-RateLimit-Reset",
+         "A 429 response carries Retry-After in seconds",
+         "Existing clients that ignore the headers keep working (contract tests green)"]},
+    {"ticket_id": "t2", "key": "ENG-1188", "url": f"{JIRA_BASE}/ENG-1188",
      "title": "Fix flaky checkout integration test", "priority": "medium",
-     "status": "open", "assignee": SQUAD, "est_effort": 2},
-    {"ticket_id": "t3", "key": "ENG-1210", "url": "https://jira.example/ENG-1210",
-     "title": "Blocked: migrate auth to OIDC", "priority": "high",
-     "status": "blocked", "assignee": SQUAD, "est_effort": 8},
+     "status": "open", "assignee": SQUAD, "est_effort": 2, "discipline": "backend",
+     "created_at": "2026-10-14T15:40:00+00:00",
+     "description": "test_checkout_applies_coupon fails about 1 run in 12 on CI.",
+     "acceptance_criteria": [
+         "test_checkout_applies_coupon passes 50 runs in a row on CI",
+         "No sleep()-based waits remain in the checkout suite"]},
+    {"ticket_id": "t3", "key": "ENG-1210", "url": f"{JIRA_BASE}/ENG-1210",
+     "title": "Migrate staff sign-in to OIDC", "priority": "high",
+     "status": "blocked", "assignee": SQUAD, "est_effort": 8, "discipline": "backend",
+     "created_at": "2026-10-09T11:05:00+00:00",
+     "description": "Blocked on the identity team issuing the OIDC client.",
+     "acceptance_criteria": ["Staff sign in through the company IdP", "Local passwords disabled"]},
+    {"ticket_id": "t4", "key": "ENG-1215", "url": f"{JIRA_BASE}/ENG-1215",
+     "title": "Payment webhook retries create duplicate refunds", "priority": "critical",
+     "status": "open", "assignee": SQUAD, "est_effort": 5, "discipline": "backend",
+     "created_at": "2026-10-30T07:58:00+00:00",
+     "description": "A retried refund.succeeded webhook issued a second refund twice last week.",
+     "acceptance_criteria": [
+         "Replaying the same refund.succeeded event twice creates exactly one refund row",
+         "The second delivery returns 200 and logs 'duplicate event ignored'",
+         "A unit test covers the replay"]},
+    {"ticket_id": "t5", "key": "ENG-1196", "url": f"{JIRA_BASE}/ENG-1196",
+     "title": "Add CSV export to the orders page", "priority": "medium",
+     "status": "open", "assignee": SQUAD, "est_effort": 3, "discipline": "frontend",
+     "created_at": "2026-10-17T13:20:00+00:00",
+     "description": "Ops downloads orders by hand every Monday.",
+     "acceptance_criteria": [
+         "An Export CSV button on /orders downloads the filtered list",
+         "The file has one row per order with id, date, customer, total, status",
+         "Exports over 10,000 rows show a 'too large, narrow the filter' message"]},
+    {"ticket_id": "t6", "key": "ENG-1219", "url": f"{JIRA_BASE}/ENG-1219",
+     "title": "Speed up the admin dashboard", "priority": "low",
+     "status": "needs_info", "assignee": SQUAD, "est_effort": 5, "discipline": "frontend",
+     "created_at": "2026-10-31T10:02:00+00:00",
+     "description": "\"It's slow.\" Waiting for the reporter to say which page and how slow.",
+     "acceptance_criteria": []},
 ]
 _RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3}
 
@@ -57,7 +105,11 @@ def assigned_tickets(assignee: str = SQUAD, exclude_in_flight: bool = True) -> l
     if exclude_in_flight:
         flying = set(_load("in_flight").keys())
         rows = [t for t in rows if t["ticket_id"] not in flying]
-    rows.sort(key=lambda t: (_RANK.get(t.get("priority", "low"), 3), int(t.get("est_effort", 99))))
+    # Priority, then OLDEST first, then smallest effort — the order the
+    # planner's prompt and the PRD promise.
+    rows.sort(key=lambda t: (_RANK.get(t.get("priority", "low"), 3),
+                             str(t.get("created_at") or "9999"),
+                             int(t.get("est_effort", 99))))
     return rows
 
 
@@ -83,7 +135,7 @@ def create_ticket(title: str, description: str = "", priority: str = "medium",
         n = int(seq.get("n", 1300)) + 1
         seq["n"] = n; _save("eng_seq", seq)
         tid, key = f"e{n}", f"ENG-{n}"
-        rec = {"ticket_id": tid, "key": key, "url": f"https://jira.example/{key}",
+        rec = {"ticket_id": tid, "key": key, "url": f"{JIRA_BASE}/{key}",
                "title": title, "description": description, "priority": priority,
                "status": "triage", "assignee": assignee, "est_effort": 3,
                "acceptance_criteria": acceptance_criteria or [],
@@ -135,33 +187,80 @@ def put_plan(ticket_id: str, plan: str) -> None:
         s=_load("plans"); s[ticket_id]={"ticket_id": ticket_id, "plan": plan, "at": _now()}; _save("plans", s)
 def get_plan(ticket_id: str) -> str:
     return (_load("plans").get(ticket_id) or {}).get("plan", "")
+# Two seeded PRs so the reviewer and the merge finisher have real-looking
+# input on day 0: #1287 (ENG-1201, CI green) and #1291 (ENG-1188, CI red —
+# drives the "CI red → back to the developer" route). The developer's dev stub
+# opens pull/0, which has no record: CI reads green and the diff says so.
+PR_BASE = "https://github.com/your-org/shop-platform/pull"   # placeholder repo
+_SEED_PRS = [
+    {"pr_url": f"{PR_BASE}/1287", "ticket_key": "ENG-1201", "branch": "feature/ENG-1201-rate-limit-headers",
+     "ci_status": "green", "files_changed": 4, "merged": False,
+     "diff": ("--- a/api/middleware/rate_limit.py\n+++ b/api/middleware/rate_limit.py\n"
+              "@@ -41,6 +41,10 @@ def apply_limit(request, bucket):\n"
+              "+    response.headers['X-RateLimit-Limit'] = str(bucket.capacity)\n"
+              "+    response.headers['X-RateLimit-Remaining'] = str(bucket.tokens)\n"
+              "+    response.headers['X-RateLimit-Reset'] = str(bucket.reset_epoch)\n"
+              "+    # Retry-After on 429 is set in errors.py\n")},
+    {"pr_url": f"{PR_BASE}/1291", "ticket_key": "ENG-1188", "branch": "fix/ENG-1188-flaky-coupon-test",
+     "ci_status": "red", "files_changed": 2, "merged": False,
+     "diff": ("--- a/tests/integration/test_checkout.py\n+++ b/tests/integration/test_checkout.py\n"
+              "@@ -88,7 +88,7 @@ def test_checkout_applies_coupon(client, cart):\n"
+              "-    time.sleep(2)\n+    wait_for(lambda: cart.coupon_applied, timeout=5)\n")},
+]
+
+
+def _prs() -> dict[str, Any]:
+    s = _load("prs")
+    if not s:
+        s = {p["pr_url"]: dict(p) for p in _SEED_PRS}; _save("prs", s)
+    return s
+
+
 def get_pr_diff(pr_url: str) -> str:
-    return _load("prs").get(pr_url, {}).get("diff", "(dev: no diff — wire GITHUB_MCP_URL)")
+    """PROD: GitHub pull-request diff. DEV: the seeded diff, or says there is none."""
+    return _prs().get(pr_url, {}).get(
+        "diff", "(dev store: no diff recorded for this PR — replace get_pr_diff with a GitHub call)")
 def get_ci_status(pr_url: str) -> str:
-    """PROD: GitHub checks API. DEV: green (override via prs store)."""
-    return _load("prs").get(pr_url, {}).get("ci_status", "green")
+    """PROD: GitHub checks API. DEV: the seeded status; a PR with no record reads green."""
+    return _prs().get(pr_url, {}).get("ci_status", "green")
 def merge_pr(pr_url: str) -> bool:
-    """PROD: gh pr merge. DEV: mark merged."""
+    """PROD: gh pr merge. DEV: mark merged. Merging an already-merged PR is a no-op."""
     with _LOCK:
-        s=_load("prs"); rec=s.get(pr_url) or {"pr_url": pr_url}; rec["merged"]=True; rec["merged_at"]=_now(); s[pr_url]=rec; _save("prs", s)
+        s=_prs(); rec=s.get(pr_url) or {"pr_url": pr_url}
+        if rec.get("merged"):
+            return True
+        rec["merged"]=True; rec["merged_at"]=_now(); s[pr_url]=rec; _save("prs", s)
     return True
+def is_merged(pr_url: str) -> bool:
+    return bool(_prs().get(pr_url, {}).get("merged"))
 
 
 # ── QA / test tickets + bugs (the QA engineer's lane) ────────────────
 QA_BOT = "qa-bot"
 _SEED_QA = [
-    {"ticket_id": "qa1", "key": "QA-440", "url": "https://jira.example/QA-440",
+    {"ticket_id": "qa1", "key": "QA-440", "url": f"{JIRA_BASE}/QA-440",
      "title": "Regression: payments API error paths", "priority": "high",
      "status": "open", "assignee": QA_BOT, "discipline": "api", "labels": ["qa"],
-     "acceptance_criteria": ["4xx on bad input", "401 without auth", "429 over the rate limit"]},
-    {"ticket_id": "qa2", "key": "QA-455", "url": "https://jira.example/QA-455",
+     "acceptance_criteria": ["POST /v2/payments with a missing amount returns 422",
+                             "Any /v2/payments call without a token returns 401",
+                             "The 101st call in a minute returns 429 with Retry-After"]},
+    {"ticket_id": "qa2", "key": "QA-455", "url": f"{JIRA_BASE}/QA-455",
      "title": "Smoke: checkout flow in the web app", "priority": "medium",
      "status": "open", "assignee": QA_BOT, "discipline": "frontend", "labels": ["qa"],
-     "acceptance_criteria": ["add to cart", "apply coupon", "complete payment", "no console errors"]},
-    {"ticket_id": "qa3", "key": "QA-460", "url": "https://jira.example/QA-460",
+     "acceptance_criteria": ["Add two items to the cart", "Apply coupon AUTUMN10 (10% off)",
+                             "Pay with the test card and see the order confirmation",
+                             "No errors in the browser console"]},
+    {"ticket_id": "qa3", "key": "QA-460", "url": f"{JIRA_BASE}/QA-460",
      "title": "Integration: order service against the new schema", "priority": "medium",
      "status": "open", "assignee": QA_BOT, "discipline": "backend", "labels": ["qa"],
-     "acceptance_criteria": ["migrations apply cleanly", "suite green", "no N+1 on order fetch"]},
+     "acceptance_criteria": ["Migrations 0141–0143 apply cleanly to a copy of staging",
+                             "The order-service suite is green",
+                             "Fetching an order with 50 lines runs at most 3 queries"]},
+    {"ticket_id": "qa4", "key": "QA-466", "url": f"{JIRA_BASE}/QA-466",
+     "title": "Regression: refund webhook replay (ENG-1215)", "priority": "critical",
+     "status": "open", "assignee": QA_BOT, "discipline": "backend", "labels": ["qa"],
+     "acceptance_criteria": ["Replaying refund.succeeded twice leaves one refund row",
+                             "The second delivery returns 200"]},
 ]
 
 
@@ -196,7 +295,7 @@ def qa_clear_in_flight(ticket_id: str) -> None:
 
 
 def claim_next_qa(discipline: str = "", assignee: str = QA_BOT) -> dict[str, Any]:
-    """ATOMIC backlog claim for the parallel QA testers (instances: N).
+    """ATOMIC backlog claim for the parallel QA testers (scaling.copies.count: N).
 
     Under one lock: find the top open, not-in-flight QA ticket (optionally for a
     discipline), mark it in-flight, and return it. Each concurrent instance that
