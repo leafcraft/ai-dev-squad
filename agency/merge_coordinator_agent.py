@@ -15,13 +15,14 @@ merges on its own say-so. It is the concrete "@chain fails closed":
      dropped. Recover it: upstream → session stash → dev store.
 
 The one back-edge (CI red → developer) is BOUNDED by a counter → escalate to a
-human at the cap, never an endless loop. PROD: wire GitHub (CI + merge) + Jira
-(transition); DEV: the store stands in and ANNOUNCES itself (green by default,
-no GITHUB_MCP_URL wired).
+human at the cap, never an endless loop. PROD: replace the store's CI / merge /
+transition functions with GitHub + Jira calls; DEV: the store stands in and
+ANNOUNCES itself in the log (seeded PRs carry their CI status; a PR with no
+record reads green). A PR that is already merged is not merged or recorded
+twice.
 """
 from __future__ import annotations
 
-import os
 from pathlib import Path
 from typing import Any
 
@@ -166,8 +167,8 @@ def enforce_merge_floor(result: Any, context: dict) -> dict:
         return result
 
     # (c) CI gate — never merge a red build. Dev store announces itself.
-    if not os.getenv("GITHUB_MCP_URL"):
-        logger.info("[merge] dev-store CI (no GITHUB_MCP_URL wired) — green by default")
+    logger.info("[merge] CI status from agency/_shared/store.py (dev store until you "
+                "replace get_ci_status with a GitHub call)")
     ci = store.get_ci_status(pr)
     result["ci_status"] = ci
     if ci != "green":
@@ -180,6 +181,14 @@ def enforce_merge_floor(result: Any, context: dict) -> dict:
             result["status"] = "needs_fix"
             logger.warning(f"[merge] CI {ci} on {pr} — NOT merging; back to developer (round {rounds})")
         _delete_partial(result)
+        return result
+
+    # Idempotent: a PR already merged (a second approval, a replay) is not
+    # merged or ledgered again.
+    if store.is_merged(pr):
+        result.update(merged=True, status="merged")
+        result["block_reasons"].append("already merged — nothing done twice")
+        logger.info(f"[merge] {pr} already merged — no second merge or ledger row")
         return result
 
     # Passed every floor — render the record, do the real merge, ledger it.

@@ -12,7 +12,7 @@ import agency.tools.tools  # noqa: F401 — registers @global_tool (jira_update,
 
 load_dotenv()
 logger = LeafMeshLogger(__name__)
-leafmesh = LeafMesh.from_yaml("configs/config.yaml")
+leafmesh = LeafMesh.from_store()
 # The custom WORM audit sink (framework: custom) is the one binding that
 # auto-discovery can't do by filename — register it explicitly.
 _audit_logger.register(leafmesh, "audit_logger_agent")
@@ -34,10 +34,8 @@ async def main():
     leafmesh.event_bus.subscribe(EventType.MANAGER_INTERVENTION, _on_manager_intervention)
     leafmesh.event_bus.subscribe(EventType.INTERVENTION_NEEDED,  _on_intervention_needed)
     leafmesh.event_bus.subscribe(EventType.HUMAN_INPUT_TIMEOUT,  _on_human_input_timeout)
-    try:
-        await leafmesh.enable_self_healing()
-    except AttributeError:
-        pass
+    # Self-healing is automatic — the SDK enables it during start() on
+    # every operator-facing mesh. No call is needed.
     logger.info("ai-dev-squad — AI Dev Squad running. API: http://127.0.0.1:18820/docs")
     stop = asyncio.Event(); loop = asyncio.get_running_loop()
     if sys.platform != "win32":
