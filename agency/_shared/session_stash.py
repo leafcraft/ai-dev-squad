@@ -41,7 +41,7 @@ def stash_update(session_id: str, patch: dict[str, Any]) -> None:
 def claim(session_id: str, key: str) -> bool:
     """ATOMIC one-shot claim within a session — True for the FIRST caller only.
 
-    The parallel QA testers (instances: N) share one session; the first copy to
+    The parallel QA testers (scaling.copies.count: N) share one session; the first copy to
     claim a fresh PR (`claim(sid, "pr:<url>")`) verifies it, the others fall
     through to the assigned-test backlog. In-process + under lock, so the N
     copies in one process race safely."""

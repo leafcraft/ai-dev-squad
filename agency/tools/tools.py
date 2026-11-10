@@ -6,6 +6,11 @@ DEV writes to the local store; PROD swaps the body for a Jira MCP call.
 The deterministic FINAL writes also happen in each agent's @chain /
 shaper, so the lifecycle is correct even if the model forgets to call
 the tool — tool for in-the-moment updates, chain for the guarantee.
+
+Note the parentheses: `@global_tool()` registers the function. A bare
+`@global_tool` (no call) silently replaces the function with the inner
+decorator and registers nothing — the agents' `tools: ["jira_update"]`
+then names a tool that does not exist.
 """
 from __future__ import annotations
 from typing import Any
@@ -17,7 +22,7 @@ logger = LeafMeshLogger(__name__)
 _VALID = {"In Progress", "In Review", "Done", "Blocked", "open"}
 
 
-@global_tool
+@global_tool(category="jira")
 def jira_update(ticket_key: str, status: str = "", comment: str = "", pr_url: str = "") -> dict[str, Any]:
     """Update a Jira ticket: set `status` (In Progress|In Review|Done|Blocked),
     add a `comment`, and/or `link a PR`. Call this as you work a ticket."""
@@ -34,7 +39,7 @@ def jira_update(ticket_key: str, status: str = "", comment: str = "", pr_url: st
     return {"ok": True, "ticket_key": ticket_key, "applied": done}
 
 
-@global_tool
+@global_tool(category="jira")
 def jira_create_bug(summary: str, severity: str = "major", discipline: str = "backend",
                     description: str = "", parent_key: str = "") -> dict[str, Any]:
     """File a bug back into Jira for a defect found in QA. `severity` is

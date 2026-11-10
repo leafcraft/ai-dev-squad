@@ -1,6 +1,6 @@
 """qa_agent — Jira-driven QA engineer (Claude Agent SDK executor), FANNED.
 
-Runs as N PARALLEL testers (config: instances: 3, instances_handoff: each).
+Runs as N PARALLEL testers (config: scaling.copies.count: 3, copies.handoff: each).
 Each copy makes an ATOMIC claim in pre_compose so copies never duplicate work:
 
   * a fresh PR (developer hand-off) is claimed by exactly ONE copy
@@ -11,7 +11,7 @@ Each copy makes an ATOMIC claim in pre_compose so copies never duplicate work:
   * a copy that claims nothing goes IDLE (did_work=false, route="") — it routes
     NOWHERE, so an empty tester never emits a spurious audit entry.
 
-Because instances_handoff is `each`, every copy routes its OWN result through
+Because scaling.copies.handoff is `each`, every copy routes its OWN result through
 the single computed `route` field — there is no cross-copy merge, so none of the
 number-sum / last-wins merge footguns apply.
 
@@ -185,7 +185,7 @@ async def qa_agent(connector_result: Any, input_data: Any, context: Any) -> dict
     if not from_dev_flow and tid:
         store.qa_clear_in_flight(tid)
 
-    # Compute the SINGLE routing signal (instances_handoff: each → per-copy).
+    # Compute the SINGLE routing signal (copies.handoff: each → per-copy).
     if from_dev_flow:
         if out["qa_verdict"] == "pass":
             out["route"] = "reviewer"
