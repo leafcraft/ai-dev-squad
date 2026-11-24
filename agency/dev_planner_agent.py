@@ -43,8 +43,10 @@ def _directed_id(input_data: Any) -> str:
     THIS one (it's in 'triage', so the autonomous queue won't surface it)."""
     if not isinstance(input_data, dict):
         return ""
-    frm = str(input_data.get("from_agent") or input_data.get("source_agent") or "")
-    msg = str(input_data.get("human_message") or "")
+    # 2.4.528: a seat's reply names the seat in `source_agent` (from_agent is
+    # the agent that asked it) and its reply_reader's reading in `verdict`.
+    frm = str(input_data.get("source_agent") or input_data.get("from_agent") or "")
+    msg = str(input_data.get("verdict") or input_data.get("human_message") or "")
     if frm != "stakeholder_human" and msg != "approve":
         return ""
     tid = input_data.get("ticket_id")
@@ -62,8 +64,8 @@ def _directed_id(input_data: Any) -> str:
 def _is_replan(input_data: Any) -> tuple[bool, str]:
     if not isinstance(input_data, dict):
         return False, ""
-    msg = str(input_data.get("human_message") or "")
-    frm = str(input_data.get("from_agent") or input_data.get("source_agent") or "")
+    msg = str(input_data.get("verdict") or input_data.get("human_message") or "")
+    frm = str(input_data.get("source_agent") or input_data.get("from_agent") or "")
     if msg == "replan" or frm == "tech_lead_human":
         # feedback may be in human_message free-text, human_data, or notes
         fb = ""
@@ -71,6 +73,9 @@ def _is_replan(input_data: Any) -> tuple[bool, str]:
         if isinstance(hd, dict):
             fb = str(hd.get("notes") or hd.get("feedback") or "")
         fb = fb or str(input_data.get("notes") or "")
+        if not fb and input_data.get("verdict"):
+            # the reader read the decision; the person's own words are the feedback
+            fb = str(input_data.get("human_message") or "")
         return True, fb
     return False, ""
 

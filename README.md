@@ -49,19 +49,23 @@ and cannot merge (a human approves; the finisher re-checks the approval and CI).
 
 ## Who decides, and what happens on silence
 
-| Seat | Real job | Replies | Waits | If nobody answers (2.4.486) | Where a real team escalates |
+| Seat | Real job | Verdicts | Waits | If nobody answers | Where a real team escalates |
 |---|---|---|---|---|---|
-| `stakeholder_human` | Product Manager | `approve` / `revise` / `reject` | 2 business days (172800 s) | Card closes; the ticket stays in `triage`, never queued | Head of Product |
-| `tech_lead_human` | Tech Lead | `build` / `replan` / `merge` / `reject` | 1 business day (86400 s) | Card closes; nothing is built or merged | Engineering Manager |
-| `senior_engineer_human` | Senior (Staff) Engineer | `approve` / `request_changes` / `reject` | 1 business day (86400 s) | Card closes; the PR is not merged | Tech Lead |
+| `stakeholder_human` | Product Manager | `approve` / `revise` / `reject` / `hold` | 2 business days (172800 s) | Default `hold` goes to the audit log; the ticket stays in `triage`, never queued | Head of Product |
+| `tech_lead_human` | Tech Lead | `build` / `replan` / `merge` / `reject` / `hold` | 1 business day (86400 s) | Default `hold` goes to the audit log; nothing is built or merged | Engineering Manager |
+| `senior_engineer_human` | Senior (Staff) Engineer | `approve` / `request_changes` / `reject` / `hold` | 1 business day (86400 s) | Default `hold` goes to the audit log; the PR is not merged | Tech Lead |
 
-When nobody answers in time, the request waits no longer: its Inbox card
-closes and the ticket records that no reply came. Nothing is sent, built or
-merged on silence, and **nobody is chased automatically** — the Manager does
-not escalate an unanswered gate. Each seat's `fallback_response`
-(`held_for_review`, which matches its audit route) is the declared intent; on
-leafmesh 2.4.486 a dual seat's timeout does not send it on. The escalation
-column is not wired yet.
+The Inbox has no buttons. Each person types a reply, and a small reply reader
+(`gpt-4o-mini`) turns it into one of that seat's verdicts. Anything that is not
+a clear decision — no, not now, wait — reads as `hold`, which goes to the audit
+log. If the person answered an agent's question instead of deciding, the
+verdict is `answer` and it goes back to only the agent that asked.
+
+When nobody answers in time, the seat's default reply (`hold`,
+`held_for_review`) goes through its routes like any reply and is recorded in
+the audit log. Nothing is sent, built or merged on silence, and **nobody is
+chased automatically** — the Manager does not escalate an unanswered question to a person. No
+person seat calls another; the escalation column is not wired yet.
 
 The **Manager** escalates to the Tech Lead only when an agent hits an error
 retrying cannot fix (auth, bad request, out of credit, bad config), when 3
@@ -81,7 +85,7 @@ Tiers 2–3 turn the stubs into real code + real connectors.
 
 | Setting | What it's for | Notes |
 |---|---|---|
-| `LEAFMESH_LICENSE_KEY` | LeafMesh runtime license | **Required.** |
+| `LEAFMESH_LICENSE_KEY` | first start | Not kept in `.env`: `create-leafmesh --start` (or `--load`) asks for it once at the first start to sign this environment in (leafmesh 2.4.538+) |
 | `ANTHROPIC_API_KEY` | The planner / reviewer / PO LLMs **and** the Claude Agent SDK | **Required.** Bedrock/Vertex/Foundry env flags work instead. |
 | `OPENAI_API_KEY` | The Manager model (`gpt-4o-mini`) | **Required** unless you change `manager.model`. |
 | `REDIS_HOST` / `REDIS_PORT` / `REDIS_PASSWORD` | State store + event broker | Defaults to `localhost:6379`. Bring your own Redis, or let `create-leafmesh --start .` start one. |

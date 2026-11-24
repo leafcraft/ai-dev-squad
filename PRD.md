@@ -98,12 +98,16 @@ hub agents, or you get re-dispatch loops). The rework cycles (QA →
 developer, review → developer, CI red → developer) are intentional and each
 is **bounded** at 3 rounds (see §4.5).
 
-**Silence (leafmesh 2.4.486).** No gate approves on silence. A dual seat's
-timeout routes nothing: when nobody answers within its
-`human_timeout_seconds`, the Inbox card closes and the ticket records that no
-reply came. Nothing is built, queued or merged, and nobody is chased
-automatically. Each seat's `fallback_response` (`held_for_review` → audit) is
-the declared intent for when the SDK sends a dual seat's fallback on.
+**Replies and silence (leafmesh 2.4.528).** Every person seat is `chain` with
+a `reply_reader` (`gpt-4o-mini`): the person types a reply in the Inbox and the
+reader turns it into a `verdict` from that seat's list; the routes read
+`verdict`. `hold` covers anything that is not a clear decision and goes to
+audit; `answer` (the person answered an agent's question) goes back to only the
+agent that asked. No gate approves on silence: when nobody answers within its
+`human_timeout_seconds`, the seat's `fallback_response` (`verdict: hold`,
+`held_for_review`) goes through its routes like any reply and lands in the
+audit log. Nothing is built, queued or merged, and nobody is chased
+automatically. No person seat calls another person seat.
 
 ---
 
@@ -169,11 +173,11 @@ ticket filed).
 
 ### 4.0b `stakeholder_human` — scope sign-off (HUMAN)
 **Role.** The business gate. Approves a groomed ticket's scope before it
-costs engineering time. Routes on `human_message`: `approve` →
+costs engineering time. Routes on `verdict`: `approve` →
 `dev_planner_agent` (queue + plan it), `revise` → `product_owner_agent`
-(re-groom — a bounded, human-gated loop), `reject` → audit. Waits two
-business days (`172800`); on silence the card closes and the ticket stays in
-`triage`.
+(re-groom — a bounded, human-gated loop), `reject` or `hold` → audit. Waits
+two business days (`172800`); on silence the default `hold` goes to audit and
+the ticket stays in `triage`.
 **Why a triage status + directed pick.** Filing as `triage` keeps the
 ticket out of the autonomous queue until a human releases it — so an
 auto-groomed ticket can't reach the developer without sign-off, and there's
@@ -204,15 +208,16 @@ stop, logged; not a loop).
 
 ### 4.2 `tech_lead_human` — plan sign-off + merge (HUMAN)
 **Role.** The human in the loop. Reviews the plan (with the ticket URL),
-and later approves the merge. Routes on `human_message`.
-**Wires** (on `human_message`).
+and later approves the merge. Routes on `verdict`.
+**Wires** (on `verdict`).
 - → `developer_agent` when `build`
 - → `dev_planner_agent` when `replan` — a human-gated loop
 - → `merge_coordinator_agent` when `merge` (the finisher re-checks it)
-- → `audit_logger_agent` when `reject` (or the declared `held_for_review` fallback)
+- → `audit_logger_agent` when `reject` or `hold` (including the timeout default)
+- → the asking agent only, when `answer`
 **Inputs.** `ticket_key, ticket_url, plan, pr_url`.
-**Waits** one business day (`86400`); on silence the card closes and nothing
-is built or merged. A real team would escalate to the Engineering Manager
+**Waits** one business day (`86400`); on silence the default `hold` goes to
+audit and nothing is built or merged. A real team would escalate to the Engineering Manager
 (not wired).
 
 ### 4.3 `developer_agent` — the coder (EXTERNAL · `claude_agent`)
@@ -285,7 +290,8 @@ PR to a senior after 3 rework rounds, so the LLM can't wave through a blocker.
 ### 4.5 `senior_engineer_human` + the rework bound
 **Role.** Cross-cutting / risky review escalation. → `merge_coordinator_agent`
 on `approve` (the senior's sign-off is the merge approval; the finisher
-re-checks it); → `developer_agent` on `request_changes`; → audit on `reject`.
+re-checks it); → `developer_agent` on `request_changes`; → audit on `reject`
+or `hold` (including the timeout default).
 Waits one business day (`86400`); a real team escalates silence to the Tech
 Lead (not wired).
 **Rework bound (LESSON FROM outbound-sdr / finance):** the fix loops are

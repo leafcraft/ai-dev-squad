@@ -10,7 +10,7 @@ merges on its own say-so. It is the concrete "@chain fails closed":
      green, the ticket known.
   c) render the real release record to ./out; on a tripped floor, DELETE the
      partial and record status=blocked with reasons — never a half-merged claim.
-  d) recovery across the HITL gate — after the human approves, the SDK re-delivers
+  d) recovery across the human step — after the human approves, the SDK re-delivers
      only human-response meta; the pr_url/ticket flowing through the chain is
      dropped. Recover it: upstream → session stash → dev store.
 
@@ -52,7 +52,7 @@ def _signal(input_data: dict) -> str:
     if isinstance(up, dict):
         sources.extend(v for v in up.values() if isinstance(v, dict))
     for src in sources:
-        for key in ("human_message", "human_decision", "decision", "message"):
+        for key in ("verdict", "human_message", "human_decision", "decision", "message"):
             val = src.get(key)
             if isinstance(val, str) and val.strip():
                 return val.strip().lower()
